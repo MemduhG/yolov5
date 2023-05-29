@@ -34,6 +34,10 @@ import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
+
+from mlflow import log_metrics, log_param, log_params, log_artifacts
+from mlflow.pytorch import log_state_dict
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -333,6 +337,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                box, obj, cls = mloss
+                log_metrics({"box_loss": float(box), "obj_loss": float(obj), "cls_loss": float(cls)}, step=ni)
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
                 pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
@@ -362,6 +368,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 plots=False,
                                                 callbacks=callbacks,
                                                 compute_loss=compute_loss)
+            
+            p, r, map50, map50_95 = results[0:4]
+            # Log validation metrics
+            log_metrics({"P": p, "R": r, "mAP50": map50, "map50-95": map50_95}, step=ni)
+            #log_metrics({"box_loss": float(box), "obj_loss": float(obj), "cls_loss": float(cls)}, step=ni)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -386,8 +397,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
+                log_state_dict(ckpt, artifact_path=f"epoch-{epoch}")
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                    log_state_dict(ckpt, artifact_path="best")
+
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
@@ -403,6 +417,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
+    
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in {-1, 0}:
         LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
@@ -425,10 +440,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         plots=plots,
                         callbacks=callbacks,
                         compute_loss=compute_loss)  # val best model with plots
+
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
         callbacks.run('on_train_end', last, best, epoch, results)
+        p, r, map50, map50_95 = results[0:4]
+        log_metrics({"P": p, "R": r, "mAP50": map50, "map50-95": map50_95}, step=ni)
 
     torch.cuda.empty_cache()
     return results
@@ -633,10 +651,10 @@ def run(**kwargs):
     opt = parse_opt(True)
     for k, v in kwargs.items():
         setattr(opt, k, v)
-    main(opt)
     return opt
 
 
 if __name__ == '__main__':
     opt = parse_opt()
+    log_params(opt.__dict__)
     main(opt)
